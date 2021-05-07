@@ -2566,6 +2566,9 @@ standardConfig configs[] = {
     createStringConfig("tls-ciphers", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphers, NULL, NULL, updateTlsCfg),
     createStringConfig("tls-ciphersuites", NULL, MODIFIABLE_CONFIG, EMPTY_STRING_IS_NULL, server.tls_ctx_config.ciphersuites, NULL, NULL, updateTlsCfg),
 #endif
+#ifdef USE_RDMA
+    createIntConfig("rdma-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.rdma_port, 0, INTEGER_CONFIG, NULL, NULL), /* RDMA port. */
+#endif
 
     /* NULL Terminator */
     {NULL}

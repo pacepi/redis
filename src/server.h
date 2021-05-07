@@ -1220,6 +1220,8 @@ struct redisServer {
     socketFds tlsfd;            /* TLS socket file descriptors */
     int sofd;                   /* Unix socket file descriptor */
     socketFds cfd;              /* Cluster bus listening socket */
+    int rdma_port;              /* RDMA listening port */
+    socketFds rdmafd;           /* RDMA CM file descriptors */
     list *clients;              /* List of active clients */
     list *clients_to_close;     /* Clients to close asynchronously */
     list *clients_pending_write; /* There is to write or install handler. */
@@ -1819,6 +1821,7 @@ void processGopherRequest(client *c);
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTLSHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+void acceptRdmaHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void readQueryFromClient(connection *conn);
 void addReplyNull(client *c);
 void addReplyNullArray(client *c);
@@ -1872,6 +1875,7 @@ char *getClientTypeName(int class);
 void flushSlavesOutputBuffers(void);
 void disconnectSlaves(void);
 int listenToPort(int port, socketFds *fds);
+int listenToRdma(int port, socketFds *fds);
 void pauseClients(mstime_t duration, pause_type type);
 void unpauseClients(void);
 int areClientsPaused(void);
