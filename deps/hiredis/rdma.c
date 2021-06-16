@@ -40,9 +40,11 @@ static int rdma_debug = 0;
 #define TRACE() if(rdma_debug){printf("%s %d\n", __func__, __LINE__);}
 
 #ifdef USE_RDMA
-#ifdef __linux__    /* currently RDMA is supported only on Linux */
+#ifdef __linux__    /* currently RDMA is only supported on Linux */
+#define __USE_MISC
 #include <arpa/inet.h>
 #include <assert.h>
+#include <endian.h>
 #include <limits.h>
 #include <netdb.h>
 #include <poll.h>
@@ -51,29 +53,54 @@ static int rdma_debug = 0;
 #include <sys/socket.h>
 #include <sys/types.h>
 
-/* send 'command' to server, server side replies lots of data segments */
-#define REDIS_MAX_SGE 512
+
+typedef enum RedisRdmaOpcode {
+    RegisterLocalAddr,
+} RedisRdmaOpcode;
+
+typedef struct RedisRdmaCmd {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t opcode;
+    uint8_t rsvd[5];
+    uint64_t addr;
+    uint32_t length;
+    uint32_t key;
+} RedisRdmaCmd;
+
+#define MIN(a, b) (a) < (b) ? a : b
+#define REDIS_MAX_SGE 1024
+#define REDIS_RDMA_DEFAULT_RX_LEN  (1024*1024)
+#define REDID_RDMA_CMD_MAGIC 'R'
 
 typedef struct RdmaContext {
     struct rdma_cm_id *cm_id;
     struct rdma_event_channel *cm_channel;
+    struct ibv_comp_channel *comp_channel;
+    struct ibv_cq *cq;
     struct ibv_pd *pd;
-    int cm_state;
 
-    int send_pending;
-    struct ibv_comp_channel *send_channel;
-    struct ibv_cq *send_cq;
-    void *send_buf;
-    struct ibv_send_wr send_wr;
+    /* TX */
+    char *tx_addr;
+    uint32_t tx_length;
+    uint32_t tx_offset;
+    uint32_t tx_key;
+    char *send_buf;
+    uint32_t send_length;
+    uint32_t send_ops;
     struct ibv_mr *send_mr;
-    struct ibv_sge send_sge;
 
-    struct ibv_comp_channel *recv_channel;
-    struct ibv_cq *recv_cq;
-    void *recv_buf;
-    struct ibv_recv_wr recv_wrs[REDIS_MAX_SGE];
+    /* RX */
+    uint32_t rx_offset;
+    char *recv_buf;
+    unsigned int recv_length;
+    unsigned int recv_offset;
     struct ibv_mr *recv_mr;
-    struct ibv_sge recv_sges[REDIS_MAX_SGE];
+
+    /* CMD 0 ~ REDIS_MAX_SGE for recv buffer
+     * REDIS_MAX_SGE ~ 2 * REDIS_MAX_SGE -1 for send buffer */
+    RedisRdmaCmd *cmd_buf;
+    struct ibv_mr *cmd_mr;
 } RdmaContext;
 
 int redisContextTimeoutMsec(redisContext *c, long *result);
@@ -89,81 +116,92 @@ static inline long redisNowMs(void) {
     return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+
+static int rdmaPostRecv(RdmaContext *ctx, struct rdma_cm_id *cm_id, RedisRdmaCmd *cmd) {
+    struct ibv_sge sge;
+    size_t length = sizeof(RedisRdmaCmd);
+    struct ibv_recv_wr recv_wr, *bad_wr;
+
+
+    sge.addr = (uint64_t)cmd;
+    sge.length = length;
+    sge.lkey = ctx->cmd_mr->lkey;
+
+    recv_wr.wr_id = (uint64_t)cmd;
+    recv_wr.sg_list = &sge;
+    recv_wr.num_sge = 1;
+    recv_wr.next = NULL;
+
+    if (rdma_debug) printf("RDMA: post cmd %p\n", (void *)cmd);
+    if (ibv_post_recv(cm_id->qp, &recv_wr, &bad_wr)) {
+        return REDIS_ERR;
+    }
+
+    return REDIS_OK;
+}
+
 static void rdmaDestroyIoBuf(RdmaContext *ctx)
 {
 TRACE();
     if (ctx->recv_mr) {
         ibv_dereg_mr(ctx->recv_mr);
-        hi_free(ctx->recv_buf);
-        ctx->recv_buf = NULL;
         ctx->recv_mr = NULL;
     }
 
+    hi_free(ctx->recv_buf);
+    ctx->recv_buf = NULL;
+
     if (ctx->send_mr) {
         ibv_dereg_mr(ctx->send_mr);
-        hi_free(ctx->send_buf);
-        ctx->send_buf = NULL;
         ctx->send_mr = NULL;
     }
+
+    hi_free(ctx->send_buf);
+    ctx->send_buf = NULL;
+
+    if (ctx->cmd_mr) {
+        ibv_dereg_mr(ctx->cmd_mr);
+        ctx->cmd_mr = NULL;
+    }
+
+    hi_free(ctx->cmd_buf);
+    ctx->cmd_buf = NULL;
 }
 
-static int rdmaSetupIoBuf(redisContext *c, RdmaContext *ctx, struct rdma_cm_id *cm_id)
-{
+static int rdmaSetupIoBuf(redisContext *c, RdmaContext *ctx, struct rdma_cm_id *cm_id) {
 TRACE();
-    int access = IBV_ACCESS_LOCAL_WRITE, i, ret;
-    size_t length = REDIS_READER_MAX_BUF;
-    struct ibv_sge *sge;
-    struct ibv_recv_wr *bad_wr;
-    struct ibv_recv_wr *recv_wr;
+    int access = IBV_ACCESS_LOCAL_WRITE;
+    size_t length = sizeof(RedisRdmaCmd) * REDIS_MAX_SGE * 2;
+    RedisRdmaCmd *cmd;
+    int i;
 
-    /* setup recv buf & MR */
-    ctx->recv_buf = hi_calloc(length, REDIS_MAX_SGE);
-    ctx->recv_mr = ibv_reg_mr(ctx->pd, ctx->recv_buf, length * REDIS_MAX_SGE, access);
-    if (!ctx->recv_mr) {
+    /* setup CMD buf & MR */
+    ctx->cmd_buf = hi_calloc(length, 1);
+    ctx->cmd_mr = ibv_reg_mr(ctx->pd, ctx->cmd_buf, length, access);
+    if (!ctx->cmd_mr) {
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: reg recv mr failed");
-        hi_free(ctx->recv_buf);
-        ctx->recv_buf = NULL;
-        return REDIS_ERR;
+	goto destroy_iobuf;
     }
 
     for (i = 0; i < REDIS_MAX_SGE; i++) {
-        sge = &ctx->recv_sges[i];
-        sge->addr = (uint64_t)ctx->recv_buf + i * length;
-        sge->length = length;
-        sge->lkey = ctx->recv_mr->lkey;
+        cmd = ctx->cmd_buf + i;
 
-        recv_wr = &ctx->recv_wrs[i];
-        recv_wr->wr_id = (uint64_t)recv_wr;
-        recv_wr->sg_list = sge;
-        recv_wr->num_sge = 1;
-        recv_wr->next = NULL;
-
-        ret = ibv_post_recv(cm_id->qp, recv_wr, &bad_wr);
-        if (ret < 0) {
+        if (rdmaPostRecv(ctx, cm_id, cmd) == REDIS_ERR) {
             __redisSetError(c, REDIS_ERR_OTHER, "RDMA: post recv failed");
             goto destroy_iobuf;
-       }
+        }
     }
 
-    /* setup send buf & MR */
-    length = REDIS_READER_MAX_BUF;
-    ctx->send_buf = hi_calloc(length, 1);
-    ctx->send_mr = ibv_reg_mr(ctx->pd, ctx->send_buf, length, access);
-    if (!ctx->send_mr) {
+    /* setup recv buf & MR */
+    access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+    length = REDIS_RDMA_DEFAULT_RX_LEN;
+    ctx->recv_buf = hi_calloc(length, 1);
+    ctx->recv_length = length;
+    ctx->recv_mr = ibv_reg_mr(ctx->pd, ctx->recv_buf, length, access);
+    if (!ctx->recv_mr) {
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: reg send mr failed");
-        hi_free(ctx->send_buf);
-        ctx->send_buf = NULL;
-        goto destroy_iobuf;
+	goto destroy_iobuf;
     }
-
-    sge = &ctx->send_sge;
-    sge->addr = (uint64_t)ctx->send_buf;
-    sge->length = length;
-    sge->lkey = ctx->send_mr->lkey;
-    ctx->send_wr.opcode = IBV_WR_SEND;
-    ctx->send_wr.send_flags = 0;
-    ctx->send_wr.sg_list = sge;
-    ctx->send_wr.num_sge = 1;
 
     return REDIS_OK;
 
@@ -172,120 +210,231 @@ destroy_iobuf:
     return REDIS_ERR;
 }
 
-static void redisRdmaClose(redisContext *c) {
-    RdmaContext *ctx = (RdmaContext *)c->privctx;
-    struct rdma_cm_id *cm_id = ctx->cm_id;
+static int rdmaAdjustSendbuf(redisContext *c, RdmaContext *ctx, unsigned int length) {
+    int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
 
-    TRACE();
-    rdmaDestroyIoBuf(ctx);
-    ibv_destroy_qp(cm_id->qp);
-    ibv_destroy_cq(ctx->recv_cq);
-    ibv_destroy_cq(ctx->send_cq);
-    ibv_destroy_comp_channel(ctx->send_channel);
-    ibv_destroy_comp_channel(ctx->recv_channel);
-    ibv_dealloc_pd(ctx->pd);
-    rdma_destroy_id(cm_id);
+TRACE();
+    if (length == ctx->send_length) {
+        return REDIS_OK;
+    }
 
-    rdma_destroy_event_channel(ctx->cm_channel);
+    /* try to free old MR & buffer */
+    if (ctx->send_length) {
+        ibv_dereg_mr(ctx->send_mr);
+        hi_free(ctx->send_buf);
+        ctx->send_length = 0;
+    }
+
+    /* create a new buffer & MR */
+    ctx->send_buf = hi_calloc(length, 1);
+    ctx->send_length = length;
+    ctx->send_mr = ibv_reg_mr(ctx->pd, ctx->send_buf, length, access);
+    if (!ctx->send_mr) {
+        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: reg send buf mr failed");
+        hi_free(ctx->send_buf);
+        ctx->send_buf = NULL;
+        ctx->send_length = 0;
+        return REDIS_ERR;
+    }
+
+if (rdma_debug) printf("RDMA: adjust send buf %p, len %d\n", ctx->send_buf, ctx->send_length);
+    return REDIS_OK;
 }
 
-static void redisRdmaFree(void *privctx) {
-    TRACE();
-    if (!privctx)
-        return;
 
-    hi_free(privctx);
+static int rdmaSendCommand(RdmaContext *ctx, struct rdma_cm_id *cm_id, RedisRdmaCmd *cmd) {
+    struct ibv_send_wr send_wr, *bad_wr;
+    struct ibv_sge sge;
+    RedisRdmaCmd *_cmd;
+    int i;
+    int ret;
+
+TRACE();
+
+    /* find an unused cmd buffer */
+    for (i = REDIS_MAX_SGE; i < 2 * REDIS_MAX_SGE; i++) {
+        _cmd = ctx->cmd_buf + i;
+        if (!_cmd->magic) {
+            break;
+        }
+    }
+
+    assert(i < 2 * REDIS_MAX_SGE);
+
+    _cmd->addr = htobe64(cmd->addr);
+    _cmd->length = htonl(cmd->length);
+    _cmd->key = htonl(cmd->key);
+    _cmd->opcode = cmd->opcode;
+    _cmd->magic = REDID_RDMA_CMD_MAGIC;
+
+    sge.addr = (uint64_t)_cmd;
+    sge.length = sizeof(RedisRdmaCmd);
+    sge.lkey = ctx->cmd_mr->lkey;
+
+    send_wr.sg_list = &sge;
+    send_wr.num_sge = 1;
+    send_wr.wr_id = (uint64_t)_cmd;
+    send_wr.opcode = IBV_WR_SEND;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+    send_wr.next = NULL;
+    ret = ibv_post_send(cm_id->qp, &send_wr, &bad_wr);
+    if (ret) {
+        return REDIS_ERR;
+    }
+
+    if (rdma_debug) printf("RDMA: SEND cmd addr %p, length %d, key 0x%x, opcode %d\n", (void *)cmd->addr, cmd->length, cmd->key, cmd->opcode);
+
+    return REDIS_OK;
 }
 
-static int connRdmaHandleCq(redisContext *c, int is_write, void *buf, size_t buf_len) {
+static int connRdmaRegisterRx(RdmaContext *ctx, struct rdma_cm_id *cm_id) {
+    RedisRdmaCmd cmd;
+
+TRACE();
+    cmd.addr = (uint64_t)ctx->recv_buf;
+    cmd.length = ctx->recv_length;
+    cmd.key = ctx->recv_mr->rkey;
+    cmd.opcode = RegisterLocalAddr;
+
+    ctx->rx_offset = 0;
+    ctx->recv_offset = 0;
+
+    return rdmaSendCommand(ctx, cm_id, &cmd);
+}
+
+static int connRdmaHandleRecv(redisContext *c, RdmaContext *ctx, struct rdma_cm_id *cm_id, RedisRdmaCmd *cmd, uint32_t byte_len) {
+    RedisRdmaCmd _cmd;
+
+TRACE();
+    if (byte_len != sizeof(RedisRdmaCmd)) {
+        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: FATAL error, recv corrupted cmd");
+        return REDIS_ERR;
+    }
+
+    _cmd.addr = be64toh(cmd->addr);
+    _cmd.length = ntohl(cmd->length);
+    _cmd.key = ntohl(cmd->key);
+    _cmd.opcode = cmd->opcode;
+    if (rdma_debug) printf("RDMA: RECV CMD addr 0x%lx, length 0x%x, opcode %d\n", _cmd.addr, _cmd.length, _cmd.opcode);
+
+    switch (_cmd.opcode) {
+    case RegisterLocalAddr:
+        ctx->tx_addr = (char *)_cmd.addr;
+        ctx->tx_length = _cmd.length;
+        ctx->tx_key = _cmd.key;
+        ctx->tx_offset = 0;
+        rdmaAdjustSendbuf(c, ctx, ctx->tx_length);
+        break;
+
+    default:
+        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: FATAL error, unknown cmd");
+        return REDIS_ERR;
+    }
+
+    return rdmaPostRecv(ctx, cm_id, cmd);
+}
+
+static int connRdmaHandleRecvImm(RdmaContext *ctx, struct rdma_cm_id *cm_id, RedisRdmaCmd *cmd, uint32_t byte_len) {
+    if (rdma_debug) printf("RDMA: Handle recv imm[%d], rx offset %d, recv_offset %d, recv_length %d\n", byte_len, ctx->rx_offset, ctx->recv_offset, ctx->recv_length);
+    assert(byte_len + ctx->rx_offset <= ctx->recv_length);
+
+    ctx->rx_offset += byte_len;
+
+    return rdmaPostRecv(ctx, cm_id, cmd);
+}
+
+static int connRdmaHandleSend(RedisRdmaCmd *cmd) {
+    /* mark this cmd has already sent */
+    cmd->magic = 0;
+
+    return REDIS_OK;
+}
+
+static int connRdmaHandleWrite(RdmaContext *ctx, uint32_t byte_len) {
+    if (rdma_debug) printf("RDMA: Handle write[%d], tx offset %d, tx length %d\n", byte_len, ctx->tx_offset, ctx->tx_length);
+
+    return REDIS_OK;
+}
+
+static int connRdmaHandleCq(redisContext *c) {
     RdmaContext *ctx = (RdmaContext *)c->privctx;
     struct rdma_cm_id *cm_id = ctx->cm_id;
     struct ibv_cq *ev_cq = NULL;
     void *ev_ctx = NULL;
     struct ibv_wc wc = {0};
-    struct ibv_recv_wr *recv_wr, *bad_wr;
-    struct ibv_comp_channel *channel;
+    RedisRdmaCmd *cmd;
     int ret;
-    long idx;
+
 TRACE();
-
-    UNUSED(buf_len);    //TODO to implement
-
-    channel = is_write ? ctx->send_channel : ctx->recv_channel;
-    if (ibv_get_cq_event(channel, &ev_cq, &ev_ctx) < 0) {
+    if (ibv_get_cq_event(ctx->comp_channel, &ev_cq, &ev_ctx) < 0) {
         if (errno != EAGAIN) {
-TRACE();
             __redisSetError(c, REDIS_ERR_OTHER, "RDMA: get cq event failed");
             return REDIS_ERR;
         }
-TRACE();
     } else if (ibv_req_notify_cq(ev_cq, 0)) {
-TRACE();
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: notify cq failed");
         return REDIS_ERR;
     }
 
- if (rdma_debug) printf("handleCQ: %s\n", ctx->recv_cq == ev_cq ? "RECV" : ctx->send_cq == ev_cq ? "SEND" : "UNKNOWN");
-
-    /* even no new CQ event, still try to poll cq. because to query a single wc
-     * every time, it works like event triggered. */
-    if (!ev_cq) {
-        ev_cq = is_write ? ctx->send_cq : ctx->recv_cq;
-    }
-
-    ret = ibv_poll_cq(ev_cq, 1, &wc);
+pollcq:
+    ret = ibv_poll_cq(ctx->cq, 1, &wc);
     if (ret < 0) {
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: poll cq failed");
         return REDIS_ERR;
     } else if (ret == 0) {
-        return 0;
+        return REDIS_OK;
     }
 
-    ibv_ack_cq_events(ev_cq, 1);
+    ibv_ack_cq_events(ctx->cq, 1);
 
-    if (rdma_debug) printf("status 0x%x, opcode 0x%x, byte_len %d\n", wc.status, wc.opcode, wc.byte_len);
+    if (rdma_debug) printf("status 0x%x, opcode 0x%x, byte_len %d, wr_id 0x%lx\n", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
 
     if (wc.status != IBV_WC_SUCCESS) {
-        printf("RDMA: CQ handle error status 0x%x\n", wc.status);
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: send/recv failed");
         return REDIS_ERR;
     }
 
     switch (wc.opcode) {
     case IBV_WC_RECV:
-        idx = ((char *)wc.wr_id - (char *)ctx->recv_wrs) / sizeof(struct ibv_recv_wr);
-        memcpy(buf, (char *)ctx->recv_buf + idx * REDIS_READER_MAX_BUF, wc.byte_len);
-
-        recv_wr = (struct ibv_recv_wr *)wc.wr_id;
-        ret = ibv_post_recv(cm_id->qp, recv_wr, &bad_wr);
-        if (ret < 0) {
-             printf("RDMA: post recv failed: ret %d, %d, %s, bad_wr %p(offset %ld)\n", ret, errno, strerror(errno), (void *)bad_wr, (char *)bad_wr - (char *)ctx->recv_wrs);
+        cmd = (RedisRdmaCmd *)wc.wr_id;
+        if (connRdmaHandleRecv(c, ctx, cm_id, cmd, wc.byte_len) == REDIS_ERR) {
             return REDIS_ERR;
         }
 
-        ret = wc.byte_len;
-
-        if (rdma_debug) printf("RDMA: RECV [%d]\n", ret);
-        //((char *)buf)[ret + 1] = 0;
-        //if (rdma_debug) printf("RDMA RECV [%d] %s\n", ret, (char *)buf);
+        if (rdma_debug) printf("RDMA: RECV [%d]\n", wc.byte_len);
         break;
 
+    case IBV_WC_RECV_RDMA_WITH_IMM:
+        cmd = (RedisRdmaCmd *)wc.wr_id;
+        if (rdma_debug) printf("RDMA: RECV IMM [%d] IMM %d, WR_ID 0x%lx\n", wc.byte_len, wc.wc_flags & IBV_WC_WITH_IMM, wc.wr_id);
+        if (connRdmaHandleRecvImm(ctx, cm_id, cmd, wc.byte_len) == REDIS_ERR) {
+            return REDIS_ERR;
+        }
+
+        break;
+    case IBV_WC_RDMA_WRITE:
+        if (rdma_debug) printf("RDMA: WRITE [%d] IMM %d, WR_ID 0x%lx\n", wc.byte_len, wc.wc_flags & IBV_WC_WITH_IMM, wc.wr_id);
+        if (connRdmaHandleWrite(ctx, wc.byte_len) == REDIS_ERR) {
+            return REDIS_ERR;
+        }
+
+        break;
     case IBV_WC_SEND:
-        ctx->send_pending = 0;
-        /* wc.byte_len makes sense. RXE implements this, but Mellanox CX5 doesn't */
-        ret = buf_len;
+        cmd = (RedisRdmaCmd *)wc.wr_id;
+        if (connRdmaHandleSend(cmd) == REDIS_ERR) {
+            return REDIS_ERR;
+        }
 
-        if (rdma_debug) printf("RDMA: SEND [%d]\n", ret);
-        //((char *)buf)[ret + 1] = 0;
-        //if (rdma_debug) printf("RDMA SEND [%d] %s\n", ret, (char *)buf);
+        if (rdma_debug) printf("RDMA: SEND [%d]\n", wc.byte_len);
         break;
-
     default:
-        if (rdma_debug) printf("RDMA: unsupported wc opcode[%d]\n", wc.opcode);
+        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: unexpected opcode");
         return REDIS_ERR;
     }
 
-    return ret;
+    goto pollcq;
+
+    return REDIS_OK;
 }
 
 #define __MAX_MSEC (((LONG_MAX) - 999) / 1000)
@@ -293,7 +442,7 @@ TRACE();
 static int redisCommandTimeoutMsec(redisContext *c, long *result)
 {
     const struct timeval *timeout = c->command_timeout;
-    long msec = -1;
+    long msec = INT_MAX;
 
     /* Only use timeout when not NULL. */
     if (timeout != NULL) {
@@ -315,82 +464,155 @@ static int redisCommandTimeoutMsec(redisContext *c, long *result)
 
 static ssize_t redisRdmaRead(redisContext *c, char *buf, size_t bufcap) {
     RdmaContext *ctx = (RdmaContext *)c->privctx;
+    struct rdma_cm_id *cm_id = ctx->cm_id;
     struct pollfd pfd;
-    int block = c->flags & REDIS_BLOCK;
-    long timed = -1, elapsed = 0;
-    int ret;
+    long timed = -1;
+    long start = redisNowMs();
+    uint32_t toread, remained;
 
 TRACE();
-
     if (redisCommandTimeoutMsec(c, &timed)) {
         return REDIS_ERR;
     }
 
-retry:
+copy:
+    if (ctx->recv_offset < ctx->rx_offset) {
+        remained = ctx->rx_offset - ctx->recv_offset;
+        toread = MIN(remained, bufcap);
+
+        memcpy(buf, ctx->recv_buf + ctx->recv_offset, toread);
+        ctx->recv_offset += toread;
+
+//if (rdma_debug) printf("RDMA: read[%d]%s\n", toread, buf);
+if (rdma_debug) printf("RDMA: read[%d]\n", toread);
+
+        if (ctx->recv_offset == ctx->recv_length) {
+            connRdmaRegisterRx(ctx, cm_id);
+        }
+
+        return toread;
+    }
+
+pollcq:
     /* try to poll a CQ firstly */
-    ret = connRdmaHandleCq(c, 0, buf, bufcap);
+    if (connRdmaHandleCq(c) == REDIS_ERR) {
+        return REDIS_ERR;
+    }
+
+    if (ctx->recv_offset < ctx->rx_offset) {
+        goto copy;
+    }
+
+    pfd.fd = ctx->comp_channel->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (poll(&pfd, 1, 1000) < 0) {
+        return REDIS_ERR;
+    }
+
+    if ((redisNowMs() - start) < timed) {
+        goto pollcq;
+    }
+
+    __redisSetError(c, REDIS_ERR_TIMEOUT, "RDMA: read timeout");
+    return REDIS_ERR;
+}
+
+
+static size_t connRdmaSend(RdmaContext *ctx, struct rdma_cm_id *cm_id, const void *data, size_t data_len) {
+    struct ibv_send_wr send_wr, *bad_wr;
+    struct ibv_sge sge;
+    uint32_t off = ctx->tx_offset;
+    char *addr = ctx->send_buf + off;
+    char *remote_addr = ctx->tx_addr + off;
+    int ret;
+
+    assert(data_len <= ctx->tx_length);
+    memcpy(addr, data, data_len);
+
+    sge.addr = (uint64_t)addr;
+    sge.lkey = ctx->send_mr->lkey;
+    sge.length = data_len;
+
+    send_wr.sg_list = &sge;
+    send_wr.num_sge = 1;
+    send_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    send_wr.send_flags = (++ctx->send_ops % REDIS_MAX_SGE) ? 0 : IBV_SEND_SIGNALED;
+    send_wr.imm_data = htonl(0);
+    send_wr.wr.rdma.remote_addr = (uint64_t)remote_addr;
+    send_wr.wr.rdma.rkey = ctx->tx_key;
+    send_wr.next = NULL;
+    ret = ibv_post_send(cm_id->qp, &send_wr, &bad_wr);
     if (ret) {
-        return ret;
+        return REDIS_ERR;
     }
 
-    if (block) {
-        pfd.fd = ctx->recv_channel->fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, 1) < 0) {
-            return REDIS_ERR;
-        }
+    if (rdma_debug) printf("RDMA: SEND TX addr %p, offset %d, key 0x%x, length %ld, send addr %p\n", ctx->tx_addr, ctx->tx_offset, ctx->tx_key, data_len, ctx->send_buf);
 
-    if ((timed > 0) && (++elapsed < timed)) {
-            goto retry;
-        }
-    }
+    ctx->tx_offset += data_len;
 
-    return 0;
+    return data_len;
 }
 
 static ssize_t redisRdmaWrite(redisContext *c) {
     RdmaContext *ctx = (RdmaContext *)c->privctx;
     struct rdma_cm_id *cm_id = ctx->cm_id;
-    struct ibv_send_wr *bad_wr;
-    size_t len = hi_sdslen(c->obuf);
+    size_t data_len = hi_sdslen(c->obuf);
     struct pollfd pfd;
-    int block = c->flags & REDIS_BLOCK;
     long timed = -1;
-    int ret;
+    long start = redisNowMs();
+    uint32_t towrite, wrote = 0;
+    size_t ret;
 
 TRACE();
-    memcpy(ctx->send_buf, c->obuf, len);
-    ctx->send_sge.length = len;
-    ctx->send_wr.opcode = IBV_WR_SEND;
-    ctx->send_wr.send_flags = IBV_SEND_SIGNALED;
-    ctx->send_wr.next = NULL;
-    ret = ibv_post_send(cm_id->qp, &ctx->send_wr, &bad_wr);
-    if (ret < 0) {
-        __redisSetError(c, REDIS_ERR_IO, "RDMA: post send failed");
-        return REDIS_ERR;
-    }
 
-    ctx->send_pending = len;
+//if (rdma_debug) printf("redisRdmaWrite: try to write[%ld] %s\n", data_len, c->obuf);
+if (rdma_debug) printf("redisRdmaWrite: try to write[%ld]\n", data_len);
 
     if (redisCommandTimeoutMsec(c, &timed)) {
         return REDIS_ERR;
     }
 
-    if (block) {
-TRACE();
-        pfd.fd = ctx->send_channel->fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        if (poll(&pfd, 1, timed) < 0) {
-            return REDIS_ERR;
-        }
+    /* try to pollcq to */
+    goto pollcq;
+
+waitcq:
+    pfd.fd = ctx->comp_channel->fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (poll(&pfd, 1, 1) < 0) {
+        return REDIS_ERR;
     }
 
-TRACE();
-    ret = connRdmaHandleCq(c, 1, c->obuf, len);
+pollcq:
+    if (connRdmaHandleCq(c) == REDIS_ERR) {
+        return REDIS_ERR;
+    }
 
-    return ret;
+    assert(ctx->tx_offset <= ctx->tx_length);
+    if (ctx->tx_offset == ctx->tx_length) {
+        /* wait a new TX buffer */
+	goto waitcq;
+    }
+
+    towrite = MIN(ctx->tx_length - ctx->tx_offset, data_len - wrote);
+    ret = connRdmaSend(ctx, cm_id, c->obuf + wrote, towrite);
+    if (ret == (size_t)REDIS_ERR) {
+        return REDIS_ERR;
+    }
+
+    wrote += ret;
+    if (wrote == data_len) {
+        return data_len;
+    }
+
+    if ((redisNowMs() - start) < timed) {
+        goto waitcq;
+    }
+
+    __redisSetError(c, REDIS_ERR_TIMEOUT, "RDMA: write timeout");
+
+    return REDIS_ERR;
 }
 
 /* RDMA has no POLLOUT event supported, so it could't work well with hiredis async mechanism */
@@ -402,6 +624,31 @@ void redisRdmaAsyncRead(redisAsyncContext *ac) {
 void redisRdmaAsyncWrite(redisAsyncContext *ac) {
     UNUSED(ac);
     assert("hiredis async mechanism can't work with RDMA" == NULL);
+}
+
+static void redisRdmaClose(redisContext *c) {
+    RdmaContext *ctx = (RdmaContext *)c->privctx;
+    struct rdma_cm_id *cm_id = ctx->cm_id;
+
+    TRACE();
+    connRdmaHandleCq(c);
+    rdma_disconnect(cm_id);
+    ibv_destroy_cq(ctx->cq);
+    rdmaDestroyIoBuf(ctx);
+    ibv_destroy_qp(cm_id->qp);
+    ibv_destroy_comp_channel(ctx->comp_channel);
+    ibv_dealloc_pd(ctx->pd);
+    rdma_destroy_id(cm_id);
+
+    rdma_destroy_event_channel(ctx->cm_channel);
+}
+
+static void redisRdmaFree(void *privctx) {
+    TRACE();
+    if (!privctx)
+        return;
+
+    hi_free(privctx);
 }
 
 redisContextFuncs redisContextRdmaFuncs = {
@@ -416,10 +663,8 @@ redisContextFuncs redisContextRdmaFuncs = {
 
 static int redisRdmaConnect(redisContext *c, struct rdma_cm_id *cm_id) {
     RdmaContext *ctx = (RdmaContext *)c->privctx;
-    struct ibv_comp_channel *send_channel = NULL;
-    struct ibv_comp_channel *recv_channel = NULL;
-    struct ibv_cq *send_cq = NULL;
-    struct ibv_cq *recv_cq = NULL;
+    struct ibv_comp_channel *comp_channel = NULL;
+    struct ibv_cq *cq = NULL;
     struct ibv_pd *pd = NULL;
     struct ibv_qp_init_attr init_attr = {0};
     struct rdma_conn_param conn_param = {0};
@@ -430,72 +675,45 @@ static int redisRdmaConnect(redisContext *c, struct rdma_cm_id *cm_id) {
         goto error;
     }
 
-    /* setup send channel/cq */
-    send_channel = ibv_create_comp_channel(cm_id->verbs);
-    if (!send_channel) {
+    comp_channel = ibv_create_comp_channel(cm_id->verbs);
+    if (!comp_channel) {
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: alloc pd failed");
         goto error;
     }
 
-    if (redisSetFdBlocking(c, send_channel->fd, 0) != REDIS_OK) {
+    if (redisSetFdBlocking(c, comp_channel->fd, 0) != REDIS_OK) {
 TRACE();
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: set recv comp channel fd non-block failed");
         goto error;
     }
 
-    send_cq = ibv_create_cq(cm_id->verbs, 1, ctx, send_channel, 0);
-    if (!send_cq) {
+    cq = ibv_create_cq(cm_id->verbs, REDIS_MAX_SGE * 2, ctx, comp_channel, 0);
+    if (!cq) {
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: create send cq failed");
         goto error;
     }
 
-    if (ibv_req_notify_cq(send_cq, 0)) {
+    if (ibv_req_notify_cq(cq, 0)) {
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: notify send cq failed");
         goto error;
     }
 
-    /* setup recv channel/cq */
-    recv_channel = ibv_create_comp_channel(cm_id->verbs);
-    if (!recv_channel) {
-        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: alloc pd failed");
-        goto error;
-    }
-
-    if (redisSetFdBlocking(c, recv_channel->fd, 0) != REDIS_OK) {
-TRACE();
-        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: set recv comp channel fd non-block failed");
-        goto error;
-    }
-
-    recv_cq = ibv_create_cq(cm_id->verbs, REDIS_MAX_SGE, ctx, recv_channel, 0);
-    if (!recv_cq) {
-        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: create recv cq failed");
-        goto error;
-    }
-
-    if (ibv_req_notify_cq(recv_cq, 0)) {
-        __redisSetError(c, REDIS_ERR_OTHER, "RDMA: notify recv cq failed");
-        goto error;
-    }
-
     /* create qp with attr */
-    init_attr.cap.max_send_wr = 1;
+    init_attr.cap.max_send_wr = REDIS_MAX_SGE;
     init_attr.cap.max_recv_wr = REDIS_MAX_SGE; 
     init_attr.cap.max_send_sge = 1; 
     init_attr.cap.max_recv_sge = 1; 
     init_attr.qp_type = IBV_QPT_RC;
-    init_attr.send_cq = send_cq;
-    init_attr.recv_cq = recv_cq;
+    init_attr.send_cq = cq;
+    init_attr.recv_cq = cq;
     if (rdma_create_qp(cm_id, pd, &init_attr)) {
         __redisSetError(c, REDIS_ERR_OTHER, "RDMA: create qp failed");
         goto error;
     }
 
     ctx->cm_id = cm_id;
-    ctx->send_channel = send_channel;
-    ctx->recv_channel = recv_channel;
-    ctx->send_cq = send_cq;
-    ctx->recv_cq = recv_cq;
+    ctx->comp_channel = comp_channel;
+    ctx->cq = cq;
     ctx->pd = pd;
 
     if (rdmaSetupIoBuf(c, ctx, cm_id) != REDIS_OK)
@@ -518,18 +736,25 @@ destroy_iobuf:
 free_qp:
     ibv_destroy_qp(cm_id->qp);
 error:
-    if (send_cq)
-        ibv_destroy_cq(send_cq);
-    if (recv_cq)
-        ibv_destroy_cq(recv_cq);
+    if (cq)
+        ibv_destroy_cq(cq);
     if (pd)
         ibv_dealloc_pd(pd);
-    if (send_channel)
-        ibv_destroy_comp_channel(send_channel);
-    if (recv_channel)
-        ibv_destroy_comp_channel(recv_channel);
+    if (comp_channel)
+        ibv_destroy_comp_channel(comp_channel);
 
     return REDIS_ERR;
+}
+
+static int redisRdmaEstablished(redisContext *c, struct rdma_cm_id *cm_id) {
+    RdmaContext *ctx = (RdmaContext *)c->privctx;
+
+    /* it's time to tell redis we have already connected */
+    c->flags |= REDIS_CONNECTED;
+    c->funcs = &redisContextRdmaFuncs;
+    c->fd = ctx->comp_channel->fd;
+
+    return connRdmaRegisterRx(ctx, cm_id);
 }
 
 static int redisRdmaCM(redisContext *c, int timeout) {
@@ -554,11 +779,7 @@ static int redisRdmaCM(redisContext *c, int timeout) {
             ret = redisRdmaConnect(c, event->id);
             break;
         case RDMA_CM_EVENT_ESTABLISHED:
-            /* it's time to tell redis we have already connected */
-            c->flags |= REDIS_CONNECTED;
-            c->funcs = &redisContextRdmaFuncs;
-            c->fd = ctx->recv_channel->fd;
-            ret = REDIS_OK;
+            ret = redisRdmaEstablished(c, event->id);
             if (rdma_debug) printf("RDMA: redisContext fd %d\n", c->fd);
             break;
         case RDMA_CM_EVENT_TIMEWAIT_EXIT:
@@ -580,7 +801,6 @@ static int redisRdmaCM(redisContext *c, int timeout) {
         }
 
         rdma_ack_cm_event(event);
-	ctx->cm_state = event->event;
     }
 
     return ret;
@@ -758,7 +978,7 @@ end:
 
 #else    /* __linux__ */
 
-"BUILD ERROR: RDMA is supported only on linux"
+"BUILD ERROR: RDMA is only supported on linux"
 
 #endif   /* __linux__ */
 #else    /* USE_RDMA */
