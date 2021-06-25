@@ -29,7 +29,7 @@
 #include "connhelpers.h"
 
 static void serverNetError(char *err, const char *fmt, ...) {
-    va_list ap; 
+    va_list ap;
 
     if (!err) return;
     va_start(ap, fmt);
@@ -37,8 +37,8 @@ static void serverNetError(char *err, const char *fmt, ...) {
     va_end(ap);
 }
 
-static int rdma_debug = 0;
-#define TRACE() if (rdma_debug){serverLog(LL_WARNING, "%s %d\n", __func__, __LINE__);}
+static int rdma_debug = 1;
+#define TRACE() if (rdma_debug){serverLog(LL_WARNING, "%s %d", __func__, __LINE__);}
 
 #ifdef USE_RDMA
 #ifdef __linux__    /* currently RDMA is only supported on Linux */
@@ -57,7 +57,7 @@ typedef struct RedisRdmaCmd {
     uint8_t magic;
     uint8_t version;
     uint8_t opcode;
-    uint8_t rsvd[5];
+    uint8_t rsvd[13];
     uint64_t addr;
     uint32_t length;
     uint32_t key;
@@ -67,6 +67,7 @@ typedef struct RedisRdmaCmd {
 #define REDIS_MAX_SGE 1024
 #define REDIS_RDMA_DEFAULT_RX_LEN  (1024*1024)
 #define REDID_RDMA_CMD_MAGIC 'R'
+#define REDIS_SYNCIO_RES 10
 
 typedef struct rdma_connection {
     connection c;
@@ -79,8 +80,10 @@ typedef struct RdmaContext {
     char *ip;
     int port;
     struct ibv_pd *pd;
+    struct rdma_event_channel *cm_channel;
     struct ibv_comp_channel *comp_channel;
     struct ibv_cq *cq;
+    long long timeEvent;
 
     /* TX */
     char *tx_addr;
@@ -124,7 +127,6 @@ static int rdmaPostRecv(RdmaContext *ctx, struct rdma_cm_id *cm_id, RedisRdmaCmd
     recv_wr.num_sge = 1;
     recv_wr.next = NULL;
 
-    if (rdma_debug) serverLog(LL_WARNING, "RDMA: post cmd %p", (void *)cmd);
     ret = ibv_post_recv(cm_id->qp, &recv_wr, &bad_wr);
     if (ret && (ret != EAGAIN)) {
         serverLog(LL_WARNING, "RDMA: post recv failed: %d", ret);
@@ -162,7 +164,7 @@ TRACE();
     ctx->cmd_buf = NULL;
 }
 
-static int rdmaSetupIoBuf(char *err, RdmaContext *ctx, struct rdma_cm_id *cm_id)
+static int rdmaSetupIoBuf(RdmaContext *ctx, struct rdma_cm_id *cm_id)
 {
 TRACE();
     int access = IBV_ACCESS_LOCAL_WRITE;
@@ -174,7 +176,7 @@ TRACE();
     ctx->cmd_buf = zcalloc(length);
     ctx->cmd_mr = ibv_reg_mr(ctx->pd, ctx->cmd_buf, length, access);
     if (!ctx->cmd_mr) {
-        serverNetError(err, "RDMA: reg mr for CMD failed");
+        serverLog(LL_WARNING, "RDMA: reg mr for CMD failed");
 	goto destroy_iobuf;
     }
 
@@ -182,7 +184,7 @@ TRACE();
         cmd = ctx->cmd_buf + i;
 
         if (rdmaPostRecv(ctx, cm_id, cmd) == C_ERR) {
-            serverNetError(err, "RDMA: post recv failed");
+            serverLog(LL_WARNING, "RDMA: post recv failed");
             goto destroy_iobuf;
         }
     }
@@ -194,7 +196,7 @@ TRACE();
     ctx->recv_length = length;
     ctx->recv_mr = ibv_reg_mr(ctx->pd, ctx->recv_buf, length, access);
     if (!ctx->recv_mr) {
-        serverNetError(err, "RDMA: reg mr for recv buffer failed");
+        serverLog(LL_WARNING, "RDMA: reg mr for recv buffer failed");
 	goto destroy_iobuf;
     }
 
@@ -225,6 +227,7 @@ static int rdmaAdjustSendbuf(RdmaContext *ctx, unsigned int length) {
     ctx->send_mr = ibv_reg_mr(ctx->pd, ctx->send_buf, length, access);
     if (!ctx->send_mr) {
         serverNetError(server.neterr, "RDMA: reg send mr failed");
+        serverLog(LL_WARNING, "RDMA: FATAL error, recv corrupted cmd");
         zfree(ctx->send_buf);
         ctx->send_buf = NULL;
         ctx->send_length = 0;
@@ -293,6 +296,39 @@ TRACE();
     ctx->recv_offset = 0;
 
     return rdmaSendCommand(ctx, cm_id, &cmd);
+}
+
+static int rdmaHandleEstablished(struct rdma_cm_event *ev)
+{
+TRACE();
+    struct rdma_cm_id *cm_id = ev->id;
+    RdmaContext *ctx = cm_id->context;
+
+    connRdmaRegisterRx(ctx, cm_id);
+
+    if (rdma_debug) serverLog(LL_WARNING, "RDMA: handle establisted %s:%d\n", ctx->ip, ctx->port);//TODO notice
+
+    return C_OK;
+}
+
+static int rdmaHandleDisconnect(struct rdma_cm_event *ev)
+{
+TRACE();
+    struct rdma_cm_id *cm_id = ev->id;
+    RdmaContext *ctx = cm_id->context;
+    connection *conn = ctx->conn;
+
+    if (rdma_debug) serverLog(LL_WARNING, "RDMA: handle disconnect %s:%d", ctx->ip, ctx->port);//TODO notice
+    conn->state = CONN_STATE_CLOSED;
+
+    /* kick connection read/write handler to avoid resource leak */
+    if (conn->read_handler) {
+        callHandler(conn, conn->read_handler);
+    } else if (conn->write_handler) {
+        callHandler(conn, conn->write_handler);
+    }
+
+    return C_OK;
 }
 
 static int connRdmaHandleRecv(RdmaContext *ctx, struct rdma_cm_id *cm_id, RedisRdmaCmd *cmd, uint32_t byte_len) {
@@ -384,7 +420,7 @@ pollcq:
     if (rdma_debug) serverLog(LL_WARNING, "status 0x%x, opcode 0x%x, byte_len %d wr_id 0x%lx\n", wc.status, wc.opcode, wc.byte_len, wc.wr_id);
 
     if (wc.status != IBV_WC_SUCCESS) {
-        serverLog(LL_WARNING, "RDMA: CQ handle error status 0x%x\n", wc.status);
+        serverLog(LL_WARNING, "RDMA: CQ handle error status 0x%x", wc.status);
         return C_ERR;
     }
 
@@ -449,46 +485,6 @@ TRACE();
     return ret;
 }
 
-static int connRdmaSetRwHandler(connection *conn) {
-    rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
-
-TRACE();
-    /* save conn into RdmaContext */
-    ctx->conn = conn;
-
-    /* IB channel only has POLLIN event */
-    if (conn->read_handler || conn->write_handler) {
-        if (aeCreateFileEvent(server.el, conn->fd, AE_READABLE, conn->type->ae_handler, conn) == AE_ERR) {
-            return C_ERR;
-        }
-    } else {
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
-    }
-
-    return C_OK;
-}
-
-static int connRdmaSetWriteHandler(connection *conn, ConnectionCallbackFunc func, int barrier) {
-TRACE();
-    conn->write_handler = func;
-    if (barrier) {
-        conn->flags |= CONN_FLAG_WRITE_BARRIER;
-    } else {
-        conn->flags &= ~CONN_FLAG_WRITE_BARRIER;
-    }
-
-    return connRdmaSetRwHandler(conn);
-}
-
-static int connRdmaSetReadHandler(connection *conn, ConnectionCallbackFunc func) {
-TRACE();
-    conn->read_handler = func;
-
-    return connRdmaSetRwHandler(conn);
-}
-
 static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask) {
 TRACE();
     rdma_connection *rdma_conn = (rdma_connection *)clientData;
@@ -509,8 +505,8 @@ TRACE();
 
     /* uplayer should read all */
     while (ctx->recv_offset < ctx->rx_offset) {
-        if (conn->read_handler) {
-            callHandler(conn, conn->read_handler);
+        if (conn->read_handler && (callHandler(conn, conn->read_handler) == C_ERR)) {
+            return;
         }
     }
 
@@ -520,11 +516,78 @@ TRACE();
     }
 
     /* TX buffer has been refreshed, try to send remaining buffer */
-    if (!ctx->tx_offset) {
+    //if (!ctx->tx_offset) {
         if (conn->write_handler) {
             callHandler(conn, conn->write_handler);
         }
+    //}
+}
+
+int connRdmaCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    connection *conn = (connection *)clientData;
+
+    if (rdma_debug) serverLog(LL_WARNING, "RDMA: CRON %p\n", clientData);
+    UNUSED(eventLoop);
+    UNUSED(id);
+    if (conn->state != CONN_STATE_CONNECTED) {
+        return REDIS_SYNCIO_RES;
     }
+
+    connRdmaEventHandler(NULL, -1, conn, 0);
+
+    return REDIS_SYNCIO_RES;
+}
+
+static int connRdmaSetRwHandler(connection *conn) {
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
+    RdmaContext *ctx = cm_id->context;
+
+TRACE();
+    /* save conn into RdmaContext */
+    ctx->conn = conn;
+
+    /* IB channel only has POLLIN event */
+    if (conn->read_handler || conn->write_handler) {
+        if (aeCreateFileEvent(server.el, conn->fd, AE_READABLE, conn->type->ae_handler, conn) == AE_ERR) {
+            return C_ERR;
+        }
+
+        if (ctx->timeEvent == -1) {
+            ctx->timeEvent = aeCreateTimeEvent(server.el, REDIS_SYNCIO_RES, connRdmaCron, conn, NULL);
+            if (ctx->timeEvent == AE_ERR) {
+                return C_ERR;
+            }
+        }
+    } else {
+        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
+        if (ctx->timeEvent > 0) {
+            aeDeleteTimeEvent(server.el, ctx->timeEvent);
+            ctx->timeEvent = -1;
+        }
+    }
+
+    return C_OK;
+}
+
+static int connRdmaSetWriteHandler(connection *conn, ConnectionCallbackFunc func, int barrier) {
+
+TRACE();
+    conn->write_handler = func;
+    if (barrier) {
+        conn->flags |= CONN_FLAG_WRITE_BARRIER;
+    } else {
+        conn->flags &= ~CONN_FLAG_WRITE_BARRIER;
+    }
+
+    return connRdmaSetRwHandler(conn);
+}
+
+static int connRdmaSetReadHandler(connection *conn, ConnectionCallbackFunc func) {
+TRACE();
+    conn->read_handler = func;
+
+    return connRdmaSetRwHandler(conn);
 }
 
 static const char *connRdmaGetLastError(connection *conn) {
@@ -532,15 +595,300 @@ TRACE();
     return strerror(conn->last_errno);
 }
 
-static int connRdmaConnect(connection *conn_, const char *addr, int port, const char *src_addr, ConnectionCallbackFunc connect_handler) {
-    UNUSED(conn_);
-    UNUSED(addr);
-    UNUSED(port);
-    UNUSED(src_addr);
-    UNUSED(connect_handler);
+static inline void rdmaConnectFailed(rdma_connection *rdma_conn) {
+    connection *conn = &rdma_conn->c;
 
-    serverLog(LL_WARNING, "RDMA: client side is not supported now");
-    return C_ERR;
+    conn->state = CONN_STATE_ERROR;
+    conn->last_errno = ENETUNREACH;
+}
+
+static int rdmaCreateResource(RdmaContext *ctx, struct rdma_cm_id *cm_id)
+{
+TRACE();
+    int ret = C_OK;
+    struct ibv_qp_init_attr init_attr;
+    struct ibv_comp_channel *comp_channel = NULL;
+    struct ibv_cq *cq = NULL;
+    struct ibv_pd *pd = NULL;
+
+    pd = ibv_alloc_pd(cm_id->verbs);
+    if (!pd) {
+        serverLog(LL_WARNING, "RDMA: ibv alloc pd failed");
+        return C_ERR;
+    }
+
+    ctx->pd = pd;
+
+    if (rdma_debug) serverLog(LL_WARNING, "RDMA: pd %p\n", (void *)pd);	//TODO remove
+
+    comp_channel = ibv_create_comp_channel(cm_id->verbs);
+    if (!comp_channel) {
+        serverLog(LL_WARNING, "RDMA: ibv create comp channel failed");
+        return C_ERR;
+    }
+
+    ctx->comp_channel = comp_channel;
+
+    cq = ibv_create_cq(cm_id->verbs, REDIS_MAX_SGE * 2, NULL, comp_channel, 0);
+    if (!cq) {
+        serverLog(LL_WARNING, "RDMA: ibv create cq failed");
+        return C_ERR;
+    }
+
+    ctx->cq = cq;
+    if (rdma_debug) serverLog(LL_WARNING, "RDMA: send cq %p\n", (void *)cq);
+
+    ibv_req_notify_cq(cq, 0);
+
+    memset(&init_attr, 0, sizeof(init_attr));
+    init_attr.cap.max_send_wr = REDIS_MAX_SGE;
+    init_attr.cap.max_recv_wr = REDIS_MAX_SGE;
+    init_attr.cap.max_send_sge = 1;
+    init_attr.cap.max_recv_sge = 1;
+    init_attr.qp_type = IBV_QPT_RC;
+    init_attr.send_cq = cq;
+    init_attr.recv_cq = cq;
+    ret = rdma_create_qp(cm_id, pd, &init_attr);
+    if (ret) {
+        serverLog(LL_WARNING, "RDMA: create qp failed");
+        return C_ERR;
+    }
+
+    if (rdmaSetupIoBuf(ctx, cm_id)) {
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
+static void rdmaReleaseResource(RdmaContext *ctx) {
+TRACE();
+    rdmaDestroyIoBuf(ctx);
+
+    if (ctx->cq) {
+        ibv_destroy_cq(ctx->cq);
+    }
+
+    if (ctx->comp_channel) {
+        ibv_destroy_comp_channel(ctx->comp_channel);
+    }
+
+    if (ctx->pd) {
+        ibv_dealloc_pd(ctx->pd);
+    }
+}
+
+static int rdmaConnect(RdmaContext *ctx, struct rdma_cm_id *cm_id) {
+    struct rdma_conn_param conn_param = {0};
+
+TRACE();
+    if (rdmaCreateResource(ctx, cm_id) == C_ERR) {
+        return C_ERR;
+    }
+
+    /* rdma connect with param */
+    conn_param.responder_resources = 1;
+    conn_param.initiator_depth = 1;
+    conn_param.retry_count = 7;
+    conn_param.rnr_retry_count = 7;
+    if (rdma_connect(cm_id, &conn_param)) {
+        return C_ERR;
+    }
+
+    anetNonBlock(NULL, ctx->comp_channel->fd);
+    anetCloexec(ctx->comp_channel->fd);
+
+    return C_OK;
+}
+
+static void rdmaCMeventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask) {
+    rdma_connection *rdma_conn = (rdma_connection *)clientData;
+    connection *conn = &rdma_conn->c;
+    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
+    RdmaContext *ctx = cm_id->context;
+    struct rdma_event_channel *cm_channel = ctx->cm_channel;
+    struct rdma_cm_event *ev;
+    enum rdma_cm_event_type ev_type;
+    int ret = C_OK;
+
+TRACE();
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+
+    ret = rdma_get_cm_event(cm_channel, &ev);
+    if (ret) {
+        if (errno != EAGAIN) {
+            serverLog(LL_WARNING, "RDMA: client channel rdma_get_cm_event failed, %s", strerror(errno));
+        }
+        return;
+    }
+
+    ev_type = ev->event;
+    if (rdma_debug) serverLog(LL_WARNING, "RDMA: client CM Handle event:cm_id %p, %d, %s", (void *)ev->id, ev_type, rdma_event_str(ev_type));    //TODO remove
+    switch (ev_type) {
+        case RDMA_CM_EVENT_ADDR_RESOLVED:
+            /* resolve route at most 100ms */
+            if (rdma_resolve_route(ev->id, 100)) {
+                rdmaConnectFailed(rdma_conn);
+            }
+            break;
+
+        case RDMA_CM_EVENT_ROUTE_RESOLVED:
+            if (rdmaConnect(ctx, ev->id) == C_ERR) {
+                rdmaConnectFailed(rdma_conn);
+            }
+            break;
+
+        case RDMA_CM_EVENT_ESTABLISHED:
+            rdmaHandleEstablished(ev);
+            conn->state = CONN_STATE_CONNECTED;
+            conn->fd = ctx->comp_channel->fd;
+            if (conn->conn_handler) {
+                callHandler(conn, conn->conn_handler);
+            }
+            break;
+
+        case RDMA_CM_EVENT_UNREACHABLE:
+        case RDMA_CM_EVENT_ROUTE_ERROR:
+        case RDMA_CM_EVENT_ADDR_ERROR:
+        case RDMA_CM_EVENT_REJECTED:
+            rdmaConnectFailed(rdma_conn);
+            break;
+
+        case RDMA_CM_EVENT_CONNECT_ERROR:
+        case RDMA_CM_EVENT_TIMEWAIT_EXIT:
+        case RDMA_CM_EVENT_CONNECT_REQUEST:
+        case RDMA_CM_EVENT_ADDR_CHANGE:
+        case RDMA_CM_EVENT_DISCONNECTED:
+            rdmaHandleDisconnect(ev);
+            break;
+
+        case RDMA_CM_EVENT_MULTICAST_JOIN:
+        case RDMA_CM_EVENT_MULTICAST_ERROR:
+        case RDMA_CM_EVENT_DEVICE_REMOVAL:
+        case RDMA_CM_EVENT_CONNECT_RESPONSE:
+        default:
+            serverLog(LL_NOTICE, "RDMA: client channel ignore event: %s", rdma_event_str(ev_type));
+    }
+
+    if (rdma_ack_cm_event(ev)) {
+        serverLog(LL_NOTICE, "RDMA: ack cm event failed\n");
+    }
+
+    /* connection error or closed by remote peer */
+    if (conn->state == CONN_STATE_ERROR) {
+        callHandler(conn, conn->conn_handler);
+    }
+}
+
+/* free resource during connection close */
+static int rdmaResolveAddr(rdma_connection *rdma_conn, const char *addr, int port, const char *src_addr) {
+    struct addrinfo hints, *servinfo = NULL, *p = NULL;
+    struct rdma_event_channel *cm_channel = NULL;
+    struct rdma_cm_id *cm_id = NULL;
+    RdmaContext *ctx = NULL;
+    struct sockaddr_storage saddr;
+    char _port[6];  /* strlen("65535") */
+    int availableAddrs = 0;
+    int ret = C_ERR;
+
+    UNUSED(src_addr);
+    ctx = zcalloc(sizeof(RdmaContext));
+    if (!ctx) {
+        serverLog(LL_WARNING, "RDMA: Out of memory");
+        goto out;
+    }
+
+    ctx->timeEvent = -1;
+    cm_channel = rdma_create_event_channel();
+    if (!cm_channel) {
+        serverLog(LL_WARNING, "RDMA: create event channel failed");
+        goto out;
+    }
+     if (rdma_debug) printf("RDMA: create cm channel %p, addr %s, port %d\n", (void *)cm_channel, addr, port);
+
+    ctx->cm_channel = cm_channel;
+
+    if (rdma_create_id(cm_channel, &cm_id, (void *)ctx, RDMA_PS_TCP)) {
+        serverLog(LL_WARNING, "RDMA: create id failed");
+        goto out;
+    }
+    if (rdma_debug) printf("RDMA: create cm id %p\n", (void *)cm_id);
+    rdma_conn->cm_id = cm_id;
+
+    if (anetNonBlock(NULL, cm_channel->fd) != C_OK) {
+TRACE();
+        serverLog(LL_WARNING, "RDMA: set cm channel fd non-block failed");
+        goto out;
+    }
+
+    snprintf(_port, 6, "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(addr, _port, &hints, &servinfo)) {
+         hints.ai_family = AF_INET6;
+         if (getaddrinfo(addr, _port, &hints, &servinfo)) {
+             serverLog(LL_WARNING, "RDMA: bad server addr info");
+             goto out;
+        }
+    }
+
+    for (p = servinfo; p != NULL; p = p->ai_next) {
+TRACE();
+        if (p->ai_family == PF_INET) {
+                memcpy(&saddr, p->ai_addr, sizeof(struct sockaddr_in));
+                ((struct sockaddr_in *)&saddr)->sin_port = htons(port);
+        } else if (p->ai_family == PF_INET6) {
+                memcpy(&saddr, p->ai_addr, sizeof(struct sockaddr_in6));
+                ((struct sockaddr_in6 *)&saddr)->sin6_port = htons(port);
+        } else {
+            serverLog(LL_WARNING, "RDMA: Unsupported family");
+            goto out;
+        }
+
+        /* resolve addr at most 100ms */
+        if (rdma_resolve_addr(cm_id, NULL, (struct sockaddr *)&saddr, 100)) {
+            continue;
+        }
+        availableAddrs++;
+    }
+
+    if (!availableAddrs) {
+        serverLog(LL_WARNING, "RDMA: server addr not available");
+        goto out;
+    }
+
+    ret = C_OK;
+
+out:
+    if(servinfo) {
+        freeaddrinfo(servinfo);
+    }
+
+    return ret;
+}
+
+static int connRdmaConnect(connection *conn, const char *addr, int port, const char *src_addr, ConnectionCallbackFunc connect_handler) {
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    struct rdma_cm_id *cm_id;
+    RdmaContext *ctx;
+
+    if (rdmaResolveAddr(rdma_conn, addr, port, src_addr) == C_ERR) {
+        return C_ERR;
+    }
+
+    cm_id = rdma_conn->cm_id;
+    ctx = cm_id->context;
+    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
+        return C_ERR;
+    }
+
+    conn->conn_handler = connect_handler;
+
+    return C_OK;
 }
 
 static int connRdmaBlockingConnect(connection *conn, const char *addr, int port, long long timeout) {
@@ -555,25 +903,41 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
 
 static void connRdmaClose(connection *conn) {
 TRACE();
-printf("connRdmaClose\n");
     rdma_connection *rdma_conn = (rdma_connection *)conn;
     struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx;
 
     if (conn->fd != -1) {
-        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE | AE_WRITABLE);
+        aeDeleteFileEvent(server.el, conn->fd, AE_READABLE);
         conn->fd = -1;
     }
 
-    connRdmaHandleCq(rdma_conn);
-    rdma_disconnect(cm_id);
-    ibv_destroy_cq(ctx->cq);
-    rdmaDestroyIoBuf(ctx);
-    ibv_destroy_qp(cm_id->qp);
-    ibv_destroy_comp_channel(ctx->comp_channel);
-    ibv_dealloc_pd(ctx->pd);
-    rdma_destroy_id(cm_id);
+    if (!cm_id) {
+        return;
+    }
 
+    ctx = cm_id->context;
+    if (ctx->timeEvent > 0) {
+        aeDeleteTimeEvent(server.el, ctx->timeEvent);
+    }
+
+    rdma_disconnect(cm_id);
+
+    /* poll all CQ before close */
+    connRdmaHandleCq(rdma_conn);
+    rdmaReleaseResource(ctx);
+    if (cm_id->qp) {
+        ibv_destroy_qp(cm_id->qp);
+    }
+
+    rdma_destroy_id(cm_id);
+    if (ctx->cm_channel) {
+        aeDeleteFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE);
+        rdma_destroy_event_channel(ctx->cm_channel);
+    }
+
+    rdma_conn->cm_id = NULL;
+    zfree(ctx);
     zfree(conn);
 }
 
@@ -639,18 +1003,9 @@ TRACE();
     return connRdmaSend(conn, data, towrite);
 }
 
-static int connRdmaRead(connection *conn, void *buf, size_t buf_len) {
-TRACE();
-    rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+static inline uint32_t rdmaRead(RdmaContext *ctx, void *buf, size_t buf_len) {
     uint32_t toread;
 
-    if (conn->state == CONN_STATE_ERROR || conn->state == CONN_STATE_CLOSED) {
-        return -1;
-    }
-
-    assert(ctx->recv_offset < ctx->rx_offset);
     toread = MIN(ctx->rx_offset - ctx->recv_offset, buf_len);
 
     assert(ctx->recv_offset + toread <= ctx->recv_length);
@@ -664,38 +1019,171 @@ TRACE();
     return toread;
 }
 
-static ssize_t connRdmaSyncWrite(connection *conn, char *ptr, ssize_t size, long long timeout) {
-TRACE();
-    UNUSED(conn);
-    UNUSED(ptr);
-    UNUSED(size);
-    UNUSED(timeout);
+static int connRdmaWait(connection *conn, long start, long timeout) {
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    long long remaining = timeout, wait, elapsed = 0;
 
-    /* TODO to be implemented */
-    serverNetError(server.neterr, "RDMA: syncwrite is to be implemented");
-    return C_ERR;
+    remaining = timeout - elapsed;
+    wait = (remaining < REDIS_SYNCIO_RES) ? remaining : REDIS_SYNCIO_RES;
+    aeWait(conn->fd, AE_READABLE, wait);
+    elapsed = mstime() - start;
+    if (elapsed >= timeout) {
+        errno = ETIMEDOUT;
+        return C_ERR;
+    }
+
+    if (connRdmaHandleCq(rdma_conn) == C_ERR) {
+        conn->state = CONN_STATE_ERROR;
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
+static int connRdmaRead(connection *conn, void *buf, size_t buf_len) {
+TRACE();
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
+    RdmaContext *ctx = cm_id->context;
+
+    if (conn->state == CONN_STATE_ERROR || conn->state == CONN_STATE_CLOSED) {
+        return C_ERR;
+    }
+
+    assert(ctx->recv_offset < ctx->rx_offset);
+
+    return rdmaRead(ctx, buf, buf_len);
+}
+
+static ssize_t connRdmaSyncWrite(connection *conn, char *ptr, ssize_t size, long long timeout) {
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
+    RdmaContext *ctx = cm_id->context;
+    ssize_t nwritten = 0;
+    long long start = mstime();
+    uint32_t towrite;
+
+TRACE();
+    if (conn->state == CONN_STATE_ERROR || conn->state == CONN_STATE_CLOSED) {
+        return C_ERR;
+    }
+
+    assert(ctx->tx_offset <= ctx->tx_length);
+    if (ctx->tx_offset < ctx->tx_length) {
+        /* TX buffer is available */
+        goto copy;
+    }
+
+wait:
+    if (connRdmaWait(conn, start, timeout) == C_ERR) {
+        return C_ERR;
+    }
+
+    if (unlikely(!ctx->send_mr)) {
+        goto wait;
+    }
+
+copy:
+    towrite = MIN(ctx->tx_length - ctx->tx_offset, size - nwritten);
+    if (connRdmaSend(conn, ptr, towrite) == (size_t)C_ERR) {
+        return C_ERR;
+    } else {
+        ptr += towrite;
+        nwritten += towrite;
+    }
+
+    if (nwritten < size) {
+        goto wait;
+    }
+
+    return size;
 }
 
 static ssize_t connRdmaSyncRead(connection *conn, char *ptr, ssize_t size, long long timeout) {
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
+    RdmaContext *ctx = cm_id->context;
+    ssize_t nread = 0;
+    long long start = mstime();
+    uint32_t toread;
+
 TRACE();
-    UNUSED(conn);
-    UNUSED(ptr);
-    UNUSED(size);
-    UNUSED(timeout);
-    /* TODO to be implemented */
-    serverNetError(server.neterr, "RDMA: syncread is to be implemented");
-    return C_ERR;
+    if (conn->state == CONN_STATE_ERROR || conn->state == CONN_STATE_CLOSED) {
+        return C_ERR;
+    }
+
+    assert(ctx->recv_offset <= ctx->rx_offset);
+    if (ctx->recv_offset < ctx->rx_offset) {
+        goto copy;
+    }
+
+wait:
+    if (connRdmaWait(conn, start, timeout) == C_ERR) {
+        return C_ERR;
+    }
+
+copy:
+    toread = rdmaRead(ctx, ptr, size - nread);
+    ptr += toread;
+    nread += toread;
+    if (nread < size) {
+        goto wait;
+    }
+
+    return size;
 }
 
 static ssize_t connRdmaSyncReadLine(connection *conn, char *ptr, ssize_t size, long long timeout) {
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
+    RdmaContext *ctx = cm_id->context;
+    ssize_t nread = 0;
+    long long start = mstime();
+    uint32_t toread;
+    char *c;
+    char nl = 0;
+
 TRACE();
-    UNUSED(conn);
-    UNUSED(ptr);
-    UNUSED(size);
-    UNUSED(timeout);
-    /* TODO to be implemented */
-    serverNetError(server.neterr, "RDMA: syncreadline is to be implemented");
-    return C_ERR;
+    if (conn->state == CONN_STATE_ERROR || conn->state == CONN_STATE_CLOSED) {
+        return C_ERR;
+    }
+
+    assert(ctx->recv_offset <= ctx->rx_offset);
+    if (ctx->recv_offset < ctx->rx_offset) {
+        goto copy;
+    }
+
+wait:
+    if (connRdmaWait(conn, start, timeout) == C_ERR) {
+        return C_ERR;
+    }
+
+copy:
+    for (toread = 0; toread <= ctx->rx_offset - ctx->recv_offset; toread++) {
+        c = ctx->recv_buf + ctx->recv_offset + toread;
+        if (*c == '\n') {
+            *c = '\0';
+            if (toread && *(c - 1) == '\r') {
+                *(c - 1) = '\0';
+            }
+            nl = 1;
+            break;
+        }
+    }
+
+if (rdma_debug) serverLog(LL_WARNING, "Readline: recv_offset %d, rx_offset %d, toread %d\n", ctx->recv_offset, ctx->rx_offset, toread);
+    toread = rdmaRead(ctx, ptr, MIN(toread + nl, size - nread));
+    ptr += toread;
+    nread += toread;
+    if (nl) {
+        return nread;
+    }
+
+    if (nread < size) {
+        goto wait;
+    }
+
+    return size;
 }
 
 static int connRdmaGetType(connection *conn) {
@@ -730,7 +1218,7 @@ static int rdmaServer(char *err, int port, char *bindaddr, int af, int index)
     struct rdma_cm_id *listen_cmid;
 
     if (ibv_fork_init()) {
-        serverNetError(err, "RDMA: ibv fork init error");
+        serverLog(LL_WARNING, "RDMA: FATAL error, recv corrupted cmd");
         return ANET_ERR;
     }
 
@@ -853,7 +1341,7 @@ int listenToRdma(int port, socketFds *sfd) {
     }
 
     sfd->fd[sfd->count] = listen_channel->fd;
-    anetNonBlock(NULL,sfd->fd[sfd->count]);
+    anetNonBlock(NULL, sfd->fd[sfd->count]);
     anetCloexec(sfd->fd[sfd->count]);
     sfd->count++;
 
@@ -866,10 +1354,6 @@ TRACE();
     int ret = C_OK;
     struct rdma_cm_id *cm_id = ev->id;
     struct sockaddr_storage caddr;
-    struct ibv_qp_init_attr init_attr;
-    struct ibv_comp_channel *comp_channel = NULL;
-    struct ibv_cq *cq = NULL;
-    struct ibv_pd *pd = NULL;
     RdmaContext *ctx = NULL;
     struct rdma_conn_param conn_param = {
             .responder_resources = 1,
@@ -892,115 +1376,31 @@ TRACE();
             *port = ntohs(s->sin6_port);
     }
 
-    pd = ibv_alloc_pd(cm_id->verbs);
-    if (!pd) {
-        serverNetError(err, "RDMA: ibv alloc pd failed");
-        return C_ERR;
-    }
-
-    if (rdma_debug) serverLog(LL_WARNING, "RDMA: pd %p\n", (void *)pd);	//TODO remove
-
-    comp_channel = ibv_create_comp_channel(cm_id->verbs);
-    if (!comp_channel) {
-        serverNetError(err, "RDMA: ibv create send comp channel failed");
-        goto free_rdma;
-    }
-
-    cq = ibv_create_cq(cm_id->verbs, REDIS_MAX_SGE * 2, NULL, comp_channel, 0);
-    if (!cq) {
-        serverNetError(err, "RDMA: ibv create cq failed");
-        goto free_rdma;
-    }
-    if (rdma_debug) serverLog(LL_WARNING, "RDMA: send cq %p\n", (void *)cq);
-
-    ibv_req_notify_cq(cq, 0);
-
-    memset(&init_attr, 0, sizeof(init_attr));
-    init_attr.cap.max_send_wr = REDIS_MAX_SGE;
-    init_attr.cap.max_recv_wr = REDIS_MAX_SGE;
-    init_attr.cap.max_send_sge = 1;
-    init_attr.cap.max_recv_sge = 1;
-    init_attr.qp_type = IBV_QPT_RC;
-    init_attr.send_cq = cq;
-    init_attr.recv_cq = cq;
-    ret = rdma_create_qp(cm_id, pd, &init_attr);
-    if (ret) {
-        serverNetError(err, "RDMA: create qp failed");
-        goto free_rdma;
-    }
-
-    ctx = zcalloc(sizeof(*ctx));
-    ctx->comp_channel = comp_channel;
-    ctx->cq = cq;
-    ctx->pd = pd;
-    if (rdmaSetupIoBuf(err, ctx, cm_id)) {
-        goto free_rdma;
+    ctx = zcalloc(sizeof(RdmaContext));
+    ctx->timeEvent = -1;
+    ctx->ip = zstrdup(ip);
+    ctx->port = *port;
+    cm_id->context = ctx;
+    if (rdmaCreateResource(ctx, cm_id) == C_ERR) {
+        goto reject;
     }
 
     ret = rdma_accept(cm_id, &conn_param);
     if (ret) {
         serverNetError(err, "RDMA: accept failed");
-        goto destroy_iobuf;
+        goto free_rdma;
     }
-
-    ctx->ip = zstrdup(ip);
-    ctx->port = *port;
-    cm_id->context = ctx;
 
     if (rdma_debug) serverLog(LL_WARNING, "RDMA: handle connect %s:%d\n", ctx->ip, ctx->port);//TODO notice
     return C_OK;
 
-destroy_iobuf:
-    rdmaDestroyIoBuf(ctx);
 free_rdma:
-    if (cm_id->qp)
-        ibv_destroy_qp(cm_id->qp);
-    if (cq)
-        ibv_destroy_cq(cq);
-    if (comp_channel)
-        ibv_destroy_comp_channel(comp_channel);
-    if (pd)
-        ibv_dealloc_pd(pd);
-
+    rdmaReleaseResource(ctx);
+reject:
     /* reject connect request if hitting error */
     rdma_reject(cm_id, NULL, 0);
 
     return C_ERR;
-}
-
-static int rdmaHandleEstablished(char *err, struct rdma_cm_event *ev)
-{
-TRACE();
-    struct rdma_cm_id *cm_id = ev->id;
-    RdmaContext *ctx = cm_id->context;
-
-    connRdmaRegisterRx(ctx, cm_id);
-
-    if (rdma_debug) serverLog(LL_WARNING, "RDMA: handle establisted %s:%d\n", ctx->ip, ctx->port);//TODO notice
-    UNUSED(err);
-
-    return C_OK;
-}
-
-static int rdmaHandleDisconnect(char *err, struct rdma_cm_event *ev)
-{
-TRACE();
-    struct rdma_cm_id *cm_id = ev->id;
-    RdmaContext *ctx = cm_id->context;
-    connection *conn = ctx->conn;
-
-    if (rdma_debug) serverLog(LL_WARNING, "RDMA: handle disconnect %s:%d\n", ctx->ip, ctx->port);//TODO notice
-    UNUSED(err);
-    conn->state = CONN_STATE_CLOSED;
-
-    /* kick connection read/write handler to avoid resource leak */
-    if (conn->read_handler) {
-        callHandler(conn, conn->read_handler);
-    } else if (conn->write_handler) {
-        callHandler(conn, conn->write_handler);
-    }
-
-    return C_OK;
 }
 
 /*
@@ -1019,14 +1419,14 @@ TRACE();
     ret = rdma_get_cm_event(listen_channel, &ev);
     if (ret) {
         if (errno != EAGAIN) {
-TRACE();
-            serverLog(LL_WARNING, "rdma_get_cm_event failed, %s\n", strerror(errno));
+            serverLog(LL_WARNING, "RDMA: listen channel rdma_get_cm_event failed, %s", strerror(errno));
+            return ANET_ERR;
         }
-        return ANET_ERR;
+        return ANET_OK;
     }
 
     ev_type = ev->event;
-    if (rdma_debug) serverLog(LL_WARNING, "Handle event:cm_id %p, %d, %s\n", (void *)ev->id, ev_type, rdma_event_str(ev_type));    //TODO remove
+    if (rdma_debug) serverLog(LL_WARNING, "Handle event: cm_id %p, %d, %s\n", (void *)ev->id, ev_type, rdma_event_str(ev_type));    //TODO remove
     switch (ev_type) {
         case RDMA_CM_EVENT_CONNECT_REQUEST:
             ret = rdmaHandleConnect(err, ev, ip, ip_len, port);
@@ -1038,48 +1438,34 @@ TRACE();
             break;
 
         case RDMA_CM_EVENT_ESTABLISHED:
-            ret = rdmaHandleEstablished(err, ev);
+            ret = rdmaHandleEstablished(ev);
             break;
 
+        case RDMA_CM_EVENT_UNREACHABLE:
+        case RDMA_CM_EVENT_ADDR_ERROR:
+        case RDMA_CM_EVENT_ROUTE_ERROR:
         case RDMA_CM_EVENT_CONNECT_ERROR:
         case RDMA_CM_EVENT_REJECTED:
         case RDMA_CM_EVENT_ADDR_CHANGE:
         case RDMA_CM_EVENT_DISCONNECTED:
-            rdmaHandleDisconnect(err, ev);
-            ret = C_OK;
-            break;
-
         case RDMA_CM_EVENT_TIMEWAIT_EXIT:
+            rdmaHandleDisconnect(ev);
+            ret = C_OK;
             break;
 
         case RDMA_CM_EVENT_MULTICAST_JOIN:
         case RDMA_CM_EVENT_MULTICAST_ERROR:
-            serverLog(LL_NOTICE, "UD-related event:%d, %s - ignored\n",
-                    ev_type, rdma_event_str(ev_type));
-            break;
-
         case RDMA_CM_EVENT_DEVICE_REMOVAL:
-            serverLog(LL_NOTICE, "Unsupported event:%d, %s - ignored\n",
-                    ev_type, rdma_event_str(ev_type));
-            break;
-
         case RDMA_CM_EVENT_ADDR_RESOLVED:
-        case RDMA_CM_EVENT_ADDR_ERROR:
         case RDMA_CM_EVENT_ROUTE_RESOLVED:
-        case RDMA_CM_EVENT_ROUTE_ERROR:
         case RDMA_CM_EVENT_CONNECT_RESPONSE:
-        case RDMA_CM_EVENT_UNREACHABLE:
-            serverLog(LL_NOTICE, "Receive event:%d, %s - ignored\n",
-                    ev_type, rdma_event_str(ev_type));
-            break;
-
         default:
-            serverLog(LL_NOTICE, "Illegal event:%d - ignored\n", ev_type);
+            serverLog(LL_NOTICE, "RDMA: listen channel ignore event: %s", rdma_event_str(ev_type));
             break;
     }
 
     if (rdma_ack_cm_event(ev)) {
-        serverLog(LL_NOTICE, "ack cm event failed\n");
+        serverLog(LL_WARNING, "ack cm event failed\n");
         return ANET_ERR;
     }
 
@@ -1087,20 +1473,20 @@ TRACE();
 }
 
 connection *connCreateRdma() {
-    rdma_connection *conn = zcalloc(sizeof(rdma_connection));
-    conn->c.type = &CT_RDMA;
-    conn->c.fd = -1;
+    rdma_connection *rdma_conn = zcalloc(sizeof(rdma_connection));
+    rdma_conn->c.type = &CT_RDMA;
+    rdma_conn->c.fd = -1;
 
-    return (connection *) conn;
+    return (connection *)rdma_conn;
 }
 
 connection *connCreateAcceptedRdma(int fd, void *priv) {
-    rdma_connection *conn = (rdma_connection *)connCreateRdma();
-    conn->c.fd = fd;
-    conn->c.state = CONN_STATE_ACCEPTING;
-    conn->cm_id = priv;
+    rdma_connection *rdma_conn = (rdma_connection *)connCreateRdma();
+    rdma_conn->c.fd = fd;
+    rdma_conn->c.state = CONN_STATE_ACCEPTING;
+    rdma_conn->cm_id = priv;
 
-    return (connection *) conn;
+    return (connection *)rdma_conn;
 }
 #else    /* __linux__ */
 

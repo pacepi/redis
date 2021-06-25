@@ -2568,6 +2568,7 @@ standardConfig configs[] = {
 #endif
 #ifdef USE_RDMA
     createIntConfig("rdma-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.rdma_port, 0, INTEGER_CONFIG, NULL, NULL), /* RDMA port. */
+    createBoolConfig("rdma-replication", NULL, MODIFIABLE_CONFIG, server.rdma_replication, 0, NULL, NULL),
 #endif
 
     /* NULL Terminator */

@@ -62,7 +62,7 @@ typedef struct RedisRdmaCmd {
     uint8_t magic;
     uint8_t version;
     uint8_t opcode;
-    uint8_t rsvd[5];
+    uint8_t rsvd[13];
     uint64_t addr;
     uint32_t length;
     uint32_t key;

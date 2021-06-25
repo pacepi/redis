@@ -1222,6 +1222,7 @@ struct redisServer {
     socketFds cfd;              /* Cluster bus listening socket */
     int rdma_port;              /* RDMA listening port */
     socketFds rdmafd;           /* RDMA CM file descriptors */
+    int rdma_replication;       /* RDMA replication */
     list *clients;              /* List of active clients */
     list *clients_to_close;     /* Clients to close asynchronously */
     list *clients_pending_write; /* There is to write or install handler. */
