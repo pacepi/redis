@@ -515,12 +515,10 @@ TRACE();
         connRdmaRegisterRx(ctx, cm_id);
     }
 
-    /* TX buffer has been refreshed, try to send remaining buffer */
-    //if (!ctx->tx_offset) {
-        if (conn->write_handler) {
-            callHandler(conn, conn->write_handler);
-        }
-    //}
+    /* RDMA comp channel has no POLLOUT event, try to send remaining buffer */
+    if (conn->write_handler) {
+        callHandler(conn, conn->write_handler);
+    }
 }
 
 int connRdmaCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
@@ -871,6 +869,27 @@ out:
     return ret;
 }
 
+static int connRdmaWait(connection *conn, long start, long timeout) {
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    long long remaining = timeout, wait, elapsed = 0;
+
+    remaining = timeout - elapsed;
+    wait = (remaining < REDIS_SYNCIO_RES) ? remaining : REDIS_SYNCIO_RES;
+    aeWait(conn->fd, AE_READABLE, wait);
+    elapsed = mstime() - start;
+    if (elapsed >= timeout) {
+        errno = ETIMEDOUT;
+        return C_ERR;
+    }
+
+    if (connRdmaHandleCq(rdma_conn) == C_ERR) {
+        conn->state = CONN_STATE_ERROR;
+        return C_ERR;
+    }
+
+    return C_OK;
+}
+
 static int connRdmaConnect(connection *conn, const char *addr, int port, const char *src_addr, ConnectionCallbackFunc connect_handler) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
     struct rdma_cm_id *cm_id;
@@ -892,13 +911,28 @@ static int connRdmaConnect(connection *conn, const char *addr, int port, const c
 }
 
 static int connRdmaBlockingConnect(connection *conn, const char *addr, int port, long long timeout) {
-    UNUSED(conn);
-    UNUSED(addr);
-    UNUSED(port);
-    UNUSED(timeout);
+    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    struct rdma_cm_id *cm_id;
+    RdmaContext *ctx;
+    long long start = mstime();
 
-    serverLog(LL_WARNING, "RDMA: client side is not supported now");
-    return C_ERR;
+    if (rdmaResolveAddr(rdma_conn, addr, port, NULL) == C_ERR) {
+        return C_ERR;
+    }
+
+    cm_id = rdma_conn->cm_id;
+    ctx = cm_id->context;
+    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
+        return C_ERR;
+    }
+
+    do {
+        if (connRdmaWait(conn, start, timeout) == C_ERR) {
+            return C_ERR ;
+        }
+    } while (conn->state != CONN_STATE_CONNECTED);
+
+    return C_OK;
 }
 
 static void connRdmaClose(connection *conn) {
@@ -961,7 +995,7 @@ static size_t connRdmaSend(connection *conn, const void *data, size_t data_len) 
     send_wr.sg_list = &sge;
     send_wr.num_sge = 1;
     send_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    send_wr.send_flags = (++ctx->send_ops % REDIS_MAX_SGE) ? 0 : IBV_SEND_SIGNALED;
+    send_wr.send_flags = (++ctx->send_ops % (REDIS_MAX_SGE / 2)) ? 0 : IBV_SEND_SIGNALED;
     send_wr.imm_data = htonl(0);
     send_wr.wr.rdma.remote_addr = (uint64_t)remote_addr;
     send_wr.wr.rdma.rkey = ctx->tx_key;
@@ -1017,27 +1051,6 @@ static inline uint32_t rdmaRead(RdmaContext *ctx, void *buf, size_t buf_len) {
     ctx->recv_offset += toread;
 
     return toread;
-}
-
-static int connRdmaWait(connection *conn, long start, long timeout) {
-    rdma_connection *rdma_conn = (rdma_connection *)conn;
-    long long remaining = timeout, wait, elapsed = 0;
-
-    remaining = timeout - elapsed;
-    wait = (remaining < REDIS_SYNCIO_RES) ? remaining : REDIS_SYNCIO_RES;
-    aeWait(conn->fd, AE_READABLE, wait);
-    elapsed = mstime() - start;
-    if (elapsed >= timeout) {
-        errno = ETIMEDOUT;
-        return C_ERR;
-    }
-
-    if (connRdmaHandleCq(rdma_conn) == C_ERR) {
-        conn->state = CONN_STATE_ERROR;
-        return C_ERR;
-    }
-
-    return C_OK;
 }
 
 static int connRdmaRead(connection *conn, void *buf, size_t buf_len) {

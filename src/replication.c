@@ -2311,6 +2311,8 @@ void syncWithMaster(connection *conn) {
                 port = server.slave_announce_port;
             else if (server.tls_replication && server.tls_port)
                 port = server.tls_port;
+            else if (server.rdma_replication && server.rdma_port)
+                port = server.rdma_port;
             else
                 port = server.port;
             sds portstr = sdsfromlonglong(port);

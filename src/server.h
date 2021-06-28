@@ -1220,9 +1220,6 @@ struct redisServer {
     socketFds tlsfd;            /* TLS socket file descriptors */
     int sofd;                   /* Unix socket file descriptor */
     socketFds cfd;              /* Cluster bus listening socket */
-    int rdma_port;              /* RDMA listening port */
-    socketFds rdmafd;           /* RDMA CM file descriptors */
-    int rdma_replication;       /* RDMA replication */
     list *clients;              /* List of active clients */
     list *clients_to_close;     /* Clients to close asynchronously */
     list *clients_pending_write; /* There is to write or install handler. */
@@ -1628,6 +1625,10 @@ struct redisServer {
                                 * failover then any replica can be used. */
     int target_replica_port; /* Failover target port */
     int failover_state; /* Failover state */
+    /* RDMA */
+    int rdma_port;              /* RDMA listening port */
+    socketFds rdmafd;           /* RDMA CM file descriptors */
+    int rdma_replication;       /* RDMA replication */
 };
 
 #define MAX_KEYS_BUFFER 256
